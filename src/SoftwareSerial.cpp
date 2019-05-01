@@ -24,18 +24,14 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include <SoftwareSerial.h>
 
-// signal quality in ALT_DIGITAL_WRITE is better or equal in all
-// tests so far (ESP8266 HW UART, SDS011 PM sensor, SoftwareSerial back-to-back).
-#define ALT_DIGITAL_WRITE 1
-
 #ifndef ESP32
 #ifndef SOFTWARESERIAL_MAX_INSTS
-#define SOFTWARESERIAL_MAX_INSTS 10
+#define SOFTWARESERIAL_MAX_INSTS 8
 #endif
 
 // As the ESP8266 Arduino attachInterrupt has no parameter, lists of objects
 // and callbacks corresponding to each possible list index have to be defined
-static ICACHE_RAM_ATTR SoftwareSerial* ObjList[SOFTWARESERIAL_MAX_INSTS];
+static SoftwareSerial* ObjList[SOFTWARESERIAL_MAX_INSTS];
 
 template<int I> void ICACHE_RAM_ATTR sws_isr() {
 	SoftwareSerial::rxRead(ObjList[I]);
@@ -76,7 +72,12 @@ SoftwareSerial::SoftwareSerial(
 		m_isrBufSize = isrBufSize ? isrBufSize : 10 * bufSize;
 		m_isrBuffer = static_cast<std::atomic<uint32_t>*>(malloc(m_isrBufSize * sizeof(uint32_t)));
 	}
-	if (isValidGPIOpin(transmitPin) || (!m_oneWire && (transmitPin == 16))) {
+	if (isValidGPIOpin(transmitPin)
+#ifdef ESP8266
+		|| (!m_oneWire && (transmitPin == 16))) {
+#else
+		) {
+#endif
 		m_txValid = true;
 		m_txPin = transmitPin;
 	}
@@ -125,16 +126,11 @@ bool SoftwareSerial::begin(int32_t baud, SoftwareSerialConfig config) {
 		m_inPos = m_outPos = 0;
 		m_isrInPos.store(0);
 		m_isrOutPos.store(0);
-		pinMode(m_rxPin, INPUT_PULLUP);
+		pinMode(m_rxPin, INPUT);
 	}
 	if (m_txValid && !m_oneWire) {
-#ifdef ALT_DIGITAL_WRITE
-		digitalWrite(m_txPin, LOW);
-		pinMode(m_txPin, m_invert ? OUTPUT : INPUT_PULLUP);
-#else
 		pinMode(m_txPin, OUTPUT);
 		digitalWrite(m_txPin, !m_invert);
-#endif
 	}
 
 	if (!m_rxEnabled) { enableRx(true); }
@@ -162,13 +158,8 @@ void SoftwareSerial::setTransmitEnablePin(int transmitEnablePin) {
 	if (isValidGPIOpin(transmitEnablePin)) {
 		m_txEnableValid = true;
 		m_txEnablePin = transmitEnablePin;
-#ifdef ALT_DIGITAL_WRITE
-		digitalWrite(m_txEnablePin, LOW);
-		pinMode(m_txEnablePin, OUTPUT);
-#else
 		pinMode(m_txEnablePin, OUTPUT);
 		digitalWrite(m_txEnablePin, LOW);
-#endif
 	} else {
 		m_txEnableValid = false;
 	}
@@ -179,29 +170,13 @@ void SoftwareSerial::enableIntTx(bool on) {
 }
 
 void SoftwareSerial::enableTx(bool on) {
-	if (m_oneWire && m_txValid) {
+	if (m_txValid && m_oneWire) {
 		if (on) {
 			enableRx(false);
-#ifdef ALT_DIGITAL_WRITE
-			digitalWrite(m_txPin, LOW);
-			pinMode(m_txPin, m_invert ? OUTPUT : INPUT_PULLUP);
-			digitalWrite(m_rxPin, LOW);
-			pinMode(m_rxPin, m_invert ? OUTPUT : INPUT_PULLUP);
-#else
 			pinMode(m_txPin, OUTPUT);
 			digitalWrite(m_txPin, !m_invert);
-			pinMode(m_rxPin, OUTPUT);
-			digitalWrite(m_rxPin, !m_invert);
-#endif
 		} else {
-#ifdef ALT_DIGITAL_WRITE
-			digitalWrite(m_txPin, LOW);
-			pinMode(m_txPin, m_invert ? OUTPUT : INPUT_PULLUP);
-#else
-			pinMode(m_txPin, OUTPUT);
-			digitalWrite(m_txPin, !m_invert);
-#endif
-			pinMode(m_rxPin, INPUT_PULLUP);
+			pinMode(m_rxPin, INPUT);
 			enableRx(true);
 		}
 	}
@@ -248,40 +223,37 @@ int SoftwareSerial::available() {
 	return avail;
 }
 
-void ICACHE_RAM_ATTR SoftwareSerial::preciseDelay(uint32_t deadline) {
-	int32_t micro_s = static_cast<int32_t>(deadline - ESP.getCycleCount()) / ESP.getCpuFreqMHz();
+void ICACHE_RAM_ATTR SoftwareSerial::preciseDelay(uint32_t deadline, bool asyn) {
 	// Reenable interrupts while delaying to avoid other tasks piling up
-	if (!m_intTxEnabled) { interrupts(); }
-	if (micro_s > 1) {
-		delayMicroseconds(micro_s - 1);
+	if (asyn && !m_intTxEnabled) { interrupts(); }
+	int32_t micro_s = static_cast<int32_t>(deadline - ESP.getCycleCount()) / ESP.getCpuFreqMHz();
+	if (micro_s > 0) {
+		if (asyn) optimistic_yield(micro_s); else delayMicroseconds(micro_s);
 	}
-	// Disable interrupts again
-	if (!m_intTxEnabled) { noInterrupts(); }
-	while (static_cast<int32_t>(deadline - ESP.getCycleCount()) > 1) {}
+	while (static_cast<int32_t>(deadline - ESP.getCycleCount()) > 0) { if (asyn) optimistic_yield(1); }
+	if (asyn) {
+		// Disable interrupts again
+		if (!m_intTxEnabled) {
+			noInterrupts();
+		}
+		m_periodDeadline = ESP.getCycleCount();
+	}
 }
 
-void ICACHE_RAM_ATTR SoftwareSerial::writePeriod(uint32_t dutyCycle, uint32_t offCycle) {
+void ICACHE_RAM_ATTR SoftwareSerial::writePeriod(uint32_t dutyCycle, uint32_t offCycle, bool withStopBit) {
 	if (dutyCycle) {
-		m_periodDeadline += dutyCycle;
-#ifdef ALT_DIGITAL_WRITE
-		pinMode(m_txPin, INPUT_PULLUP);
-#else
 		digitalWrite(m_txPin, HIGH);
-#endif
-		preciseDelay(m_periodDeadline);
+		m_periodDeadline += dutyCycle;
+		preciseDelay(m_periodDeadline, withStopBit && !m_invert);
 	}
 	if (offCycle) {
-		m_periodDeadline += offCycle;
-#ifdef ALT_DIGITAL_WRITE
-		pinMode(m_txPin, OUTPUT);
-#else
 		digitalWrite(m_txPin, LOW);
-#endif
-		preciseDelay(m_periodDeadline);
+		m_periodDeadline += offCycle;
+		preciseDelay(m_periodDeadline, withStopBit && m_invert);
 	}
 }
 
-size_t ICACHE_RAM_ATTR SoftwareSerial::write(uint8_t b) {
+size_t SoftwareSerial::write(uint8_t b) {
 	return write(&b, 1);
 }
 
@@ -290,54 +262,45 @@ size_t ICACHE_RAM_ATTR SoftwareSerial::write(const uint8_t *buffer, size_t size)
 	if (!m_txValid) { return 0; }
 
 	if (m_txEnableValid) {
-#ifdef ALT_DIGITAL_WRITE
-		pinMode(m_txEnablePin, INPUT_PULLUP);
-#else
 		digitalWrite(m_txEnablePin, HIGH);
-#endif
 	}
-	// Stop bit level : LOW if inverted logic, otherwise HIGH
-#ifdef ALT_DIGITAL_WRITE
-	pinMode(m_txPin, m_invert ? OUTPUT : INPUT_PULLUP);
-#else
-	digitalWrite(m_txPin, !m_invert);
-#endif
-	uint32_t dutyCycle = 0;
-	uint32_t offCycle = 0;
-	bool pb;
+	// Stop bit : LOW if inverted logic, otherwise HIGH
+	bool b = !m_invert;
+	// Force line level on entry
+	uint32_t dutyCycle = b;
+	uint32_t offCycle = m_invert;
 	// Disable interrupts in order to get a clean transmit timing
 	if (!m_intTxEnabled) { noInterrupts(); }
 	m_periodDeadline = ESP.getCycleCount();
-	for (int cnt = 0; cnt < size; ++cnt, ++buffer) {
+	const uint32_t dataMask = ((1UL << m_dataBits) - 1);
+	for (size_t cnt = 0; cnt < size; ++cnt, ++buffer) {
+		bool withStopBit = true;
+		// push LSB start-data-stop bit pattern into uint32_t
+		// Stop bit : LOW if inverted logic, otherwise HIGH
+		uint32_t word = (!m_invert) << m_dataBits;
+		word |= (m_invert ? ~*buffer : *buffer) & dataMask;
 		// Start bit : HIGH if inverted logic, otherwise LOW
-		if (m_invert) { dutyCycle += m_bitCycles; } else { offCycle += m_bitCycles; }
-		pb = m_invert;
-		uint8_t o = m_invert ? ~*buffer : *buffer;
-		bool b;
-		for (int i = 0; i <= m_dataBits; ++i) {
-			// data bit
-			// or stop bit : LOW if inverted logic, otherwise HIGH
-			b = (i < m_dataBits) ? (o & 1) : !m_invert;
-			o >>= 1;
+		word <<= 1;
+		word |= m_invert;
+		for (int i = 0; i <= m_dataBits + 1; ++i) {
+			bool pb = b;
+			b = (word >> i) & 1;
 			if (!pb && b) {
-				writePeriod(dutyCycle, offCycle);
+				writePeriod(dutyCycle, offCycle, withStopBit);
+				withStopBit = false;
 				dutyCycle = offCycle = 0;
 			}
-			if (b) { dutyCycle += m_bitCycles; } else { offCycle += m_bitCycles; }
-			pb = b;
-		}
-		if (cnt == size - 1) {
-			writePeriod(dutyCycle, offCycle);
-			break;
+			if (b) {
+				dutyCycle += m_bitCycles;
+			} else {
+				offCycle += m_bitCycles;
+			}
 		}
 	}
+	writePeriod(dutyCycle, offCycle, true);
 	if (!m_intTxEnabled) { interrupts(); }
 	if (m_txEnableValid) {
-#ifdef ALT_DIGITAL_WRITE
-		pinMode(m_txEnablePin, OUTPUT);
-#else
 		digitalWrite(m_txEnablePin, LOW);
-#endif
 	}
 	return size;
 }
@@ -359,7 +322,7 @@ int SoftwareSerial::peek() {
 	return m_buffer[m_outPos];
 }
 
-void ICACHE_RAM_ATTR SoftwareSerial::rxBits() {
+void SoftwareSerial::rxBits() {
 	int avail = m_isrInPos.load() - m_isrOutPos.load();
 	if (avail < 0) { avail += m_isrBufSize; }
 	if (m_isrOverflow.load()) {
@@ -463,9 +426,9 @@ void SoftwareSerial::onReceive(std::function<void(int available)> handler) {
 }
 
 void SoftwareSerial::perform_work() {
+	if (!m_rxValid) { return; }
+	rxBits();
 	if (receiveHandler) {
-		if (!m_rxValid) { return; }
-		rxBits();
 		int avail = m_inPos - m_outPos;
 		if (avail < 0) { avail += m_bufSize; }
 		if (avail) { receiveHandler(avail); }
