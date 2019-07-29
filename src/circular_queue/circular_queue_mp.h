@@ -52,6 +52,7 @@ public:
     using circular_queue<T>::pop;
     using circular_queue<T>::pop_n;
     using circular_queue<T>::for_each;
+    using circular_queue<T>::for_each_rev_requeue;
 
     /*!
         @brief	Resize the queue. The available elements in the queue are preserved.
@@ -127,7 +128,7 @@ public:
                 Requeuing is dependent on the return boolean of the callback function. If it
                 returns true, the requeue occurs.
     */
-    bool for_each_requeue(std::function<bool(T&)> fun);
+    bool for_each_requeue(const std::function<bool(T&)>& fun);
 
 #ifndef ESP8266
 protected:
@@ -156,14 +157,14 @@ T& circular_queue_mp<T>::pop_requeue()
 }
 
 template< typename T >
-bool circular_queue_mp<T>::for_each_requeue(std::function<bool(T&)> fun)
+bool circular_queue_mp<T>::for_each_requeue(const std::function<bool(T&)>& fun)
 {
     auto inPos0 = circular_queue<T>::m_inPos.load(std::memory_order_acquire);
     auto outPos = circular_queue<T>::m_outPos.load(std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_acquire);
     if (outPos == inPos0) return false;
     do {
-        T& val = circular_queue<T>::m_buffer[outPos];
+        T&& val = std::move(circular_queue<T>::m_buffer[outPos]);
         if (fun(val))
         {
 #ifdef ESP8266

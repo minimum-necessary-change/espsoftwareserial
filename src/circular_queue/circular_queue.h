@@ -33,6 +33,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #define IRAM_ATTR
 #endif
 
+using std::min;
+
 /*!
     @brief	Instance class for a single-producer, single-consumer circular queue / ring buffer (FIFO).
             This implementation is lock-free between producer and consumer for the available(), peek(),
@@ -177,7 +179,15 @@ public:
         @brief	Iterate over and remove each available element from queue,
                 calling back fun with an rvalue reference of every single element.
     */
-    void for_each(std::function<void(T&&)> fun);
+    void for_each(const std::function<void(T&&)>& fun);
+
+    /*!
+        @brief	In reverse order, iterate over, pop and optionally requeue each available element from the queue,
+                calling back fun with a reference of every single element.
+                Requeuing is dependent on the return boolean of the callback function. If it
+                returns true, the requeue occurs.
+    */
+    bool for_each_rev_requeue(const std::function<bool(T&)>& fun);
 
 protected:
     const T defaultValue = {};
@@ -228,7 +238,7 @@ size_t circular_queue<T>::push_n(const T* buffer, size_t size)
     const auto outPos = m_outPos.load(std::memory_order_relaxed);
 
     size_t blockSize = (outPos > inPos) ? outPos - 1 - inPos : (outPos == 0) ? m_bufSize - 1 - inPos : m_bufSize - inPos;
-    blockSize = std::min(size, blockSize);
+    blockSize = min(size, blockSize);
     if (!blockSize) return 0;
     int next = (inPos + blockSize) % m_bufSize;
 
@@ -236,7 +246,7 @@ size_t circular_queue<T>::push_n(const T* buffer, size_t size)
 
     auto dest = m_buffer.get() + inPos;
     std::copy_n(std::make_move_iterator(buffer), blockSize, dest);
-    size = std::min(size - blockSize, outPos > 1 ? static_cast<size_t>(outPos - next - 1) : 0);
+    size = min(size - blockSize, outPos > 1 ? static_cast<size_t>(outPos - next - 1) : 0);
     next += size;
     dest = m_buffer.get();
     std::copy_n(std::make_move_iterator(buffer + blockSize), size, dest);
@@ -265,10 +275,10 @@ T circular_queue<T>::pop()
 
 template< typename T >
 size_t circular_queue<T>::pop_n(T* buffer, size_t size) {
-    size_t avail = size = std::min(size, available());
+    size_t avail = size = min(size, available());
     if (!avail) return 0;
     const auto outPos = m_outPos.load(std::memory_order_acquire);
-    size_t n = std::min(avail, static_cast<size_t>(m_bufSize - outPos));
+    size_t n = min(avail, static_cast<size_t>(m_bufSize - outPos));
 
     std::atomic_thread_fence(std::memory_order_acquire);
 
@@ -283,7 +293,7 @@ size_t circular_queue<T>::pop_n(T* buffer, size_t size) {
 }
 
 template< typename T >
-void circular_queue<T>::for_each(std::function<void(T&&)> fun)
+void circular_queue<T>::for_each(const std::function<void(T&&)>& fun)
 {
     auto outPos = m_outPos.load(std::memory_order_acquire);
     const auto inPos = m_inPos.load(std::memory_order_relaxed);
@@ -295,6 +305,29 @@ void circular_queue<T>::for_each(std::function<void(T&&)> fun)
         outPos = (outPos + 1) % m_bufSize;
         m_outPos.store(outPos, std::memory_order_release);
     }
+}
+
+template< typename T >
+bool circular_queue<T>::for_each_rev_requeue(const std::function<bool(T&)>& fun)
+{
+    auto inPos0 = circular_queue<T>::m_inPos.load(std::memory_order_acquire);
+    auto outPos = circular_queue<T>::m_outPos.load(std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (outPos == inPos0) return false;
+    auto pos = inPos0;
+    auto outPos1 = inPos0;
+    const auto posDecr = circular_queue<T>::m_bufSize - 1;
+    do {
+        pos = (pos + posDecr) % circular_queue<T>::m_bufSize;
+        T&& val = std::move(circular_queue<T>::m_buffer[pos]);
+        if (fun(val))
+        {
+            outPos1 = (outPos1 + posDecr) % circular_queue<T>::m_bufSize;
+            if (outPos1 != pos) circular_queue<T>::m_buffer[outPos1] = std::move(val);
+        }
+    } while (pos != outPos);
+    circular_queue<T>::m_outPos.store(outPos1, std::memory_order_release);
+    return true;
 }
 
 #endif // __circular_queue_h
